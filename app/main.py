@@ -1,7 +1,14 @@
-"""FastAPI service: merge two consecutive OCI diff layers into one.
+"""FastAPI service: OCI layer tooling.
 
-Uploads are streamed to private spool files first; the merged tar is only
-produced (and therefore downloadable) when both input layers have been fully
+* ``POST /merge`` merges two consecutive uncompressed OCI diff layers.
+* ``POST /repack`` turns an uploaded OCI Image Layout tar into a transport
+  friendly archive: every uncompressed layer is streamed through gzip (shared
+  layers only once), already-gzip layers are kept, the per-platform image
+  manifests are rewritten and the top level index is flattened to reference
+  them directly.
+
+Uploads are streamed to private spool files first; an artifact is only
+produced (and therefore downloadable) when all inputs have been fully
 validated.  Any invalid input yields HTTP 400 and no artifact.
 """
 
@@ -16,20 +23,37 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
+from .layout import LayoutError, cleanup_workdir, repack_layout_tar
 from .merger import InvalidLayer, LayerMerger
 
-MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB per layer
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB per layer upload
+
+
+def _env_bytes(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+MAX_LAYOUT_ARCHIVE_BYTES = _env_bytes(
+    "REPACK_MAX_UPLOAD_BYTES", 4 * 1024 * 1024 * 1024
+)  # 4 GiB layout archive by default
 READ_CHUNK = 1024 * 1024
 
 app = FastAPI(
-    title="OCI Layer Merger",
-    version="1.0.0",
+    title="OCI Layer Tools",
+    version="2.0.0",
     description=(
-        "Combine two consecutive, uncompressed OCI diff layers (ordered "
-        "lower then upper) into a single reusable diff layer. Regular files, "
-        "directories and whiteouts (including opaque directory markers) are "
-        "supported. Upload both tars as multipart/form-data and download the "
-        "merged uncompressed tar on success."
+        "Layer tooling for air-gapped transport. `POST /merge` combines two "
+        "consecutive uncompressed OCI diff layers (ordered lower then upper) "
+        "into a single reusable diff layer. `POST /repack` rewrites an OCI "
+        "Image Layout tar so that every uncompressed layer becomes a gzip "
+        "layer (each shared blob compressed only once), manifests and the top "
+        "level index are updated, and the resulting archive can be imported "
+        "per platform."
     ),
 )
 
@@ -42,12 +66,16 @@ def _cleanup(path: str) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
-def _spool_upload(upload: UploadFile, workdir: str) -> str:
+def _spool_upload(
+    upload: UploadFile, workdir: str, max_bytes: int = MAX_UPLOAD_BYTES
+) -> str:
     """Stream an upload into a private spool file, enforcing the size cap."""
     if not upload.filename:
         raise HTTPException(status_code=400, detail="missing upload filename")
     safe_name = os.path.basename(upload.filename).replace("/", "_") or "layer.tar"
-    spool = os.path.join(workdir, safe_name)
+    upload_dir = os.path.join(workdir, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    spool = os.path.join(upload_dir, safe_name)
     total = 0
     try:
         with open(spool, "wb") as dst:
@@ -56,10 +84,10 @@ def _spool_upload(upload: UploadFile, workdir: str) -> str:
                 if not chunk:
                     break
                 total += len(chunk)
-                if total > MAX_UPLOAD_BYTES:
+                if total > max_bytes:
                     raise HTTPException(
                         status_code=413,
-                        detail=f"layer exceeds {MAX_UPLOAD_BYTES} byte limit",
+                        detail=f"upload exceeds {max_bytes} byte limit",
                     )
                 dst.write(chunk)
     finally:
@@ -113,6 +141,51 @@ def merge_layers(
             media_type="application/x-tar",
             filename="merged-layer.tar",
             background=BackgroundTask(_cleanup, workdir),
+        )
+    except HTTPException:
+        _cleanup(workdir)
+        raise
+    except Exception:
+        _cleanup(workdir)
+        raise
+
+
+@app.post(
+    "/repack",
+    tags=["layout"],
+    responses={
+        200: {
+            "content": {"application/x-tar": {}},
+            "description": "Repacked OCI Image Layout archive",
+        },
+        400: {"description": "Invalid layout, missing blob or conversion failure"},
+        413: {"description": "Upload too large"},
+    },
+)
+def repack_layout(
+    layout: UploadFile = File(..., description="OCI Image Layout tar (uncompressed)"),
+) -> FileResponse:
+    """Compress uncompressed layers and flatten the layout for transport.
+
+    The upload must be an uncompressed tar containing an OCI image layout.
+    Every layer is rewritten in place; the resulting ``index.json`` lists the
+    per-platform image manifests directly.  The download is only offered once
+    the whole layout has been validated.
+    """
+    workdir = tempfile.mkdtemp(prefix="layoutrepack-req-")
+    try:
+        upload_path = _spool_upload(layout, workdir, MAX_LAYOUT_ARCHIVE_BYTES)
+        output_path = os.path.join(workdir, "repacked-layout.tar")
+        try:
+            repack_layout_tar(upload_path, workdir, output_path)
+        except LayoutError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return FileResponse(
+            output_path,
+            media_type="application/x-tar",
+            filename="repacked-layout.tar",
+            background=BackgroundTask(cleanup_workdir, workdir),
         )
     except HTTPException:
         _cleanup(workdir)

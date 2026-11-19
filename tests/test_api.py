@@ -25,9 +25,10 @@ def test_health_and_docs_available():
     assert client.get("/health").json() == {"status": "ok"}
     docs = client.get("/docs")
     assert docs.status_code == 200
-    assert "OCI Layer Merger" in docs.text
+    assert "OCI Layer Tools" in docs.text
     openapi = client.get("/openapi.json").json()
     assert "/merge" in openapi["paths"]
+    assert "/repack" in openapi["paths"]
 
 
 def test_merge_endpoint_returns_downloadable_tar():

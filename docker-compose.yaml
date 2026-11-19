@@ -1,13 +1,18 @@
 services:
   layer-merger:
     build: .
-    image: oci-layer-merger:1.0.0
-    container_name: oci-layer-merger
+    image: oci-layer-tools:2.0.0
+    container_name: oci-layer-tools
     ports:
       - "8000:8000"
     restart: unless-stopped
     read_only: true
     tmpfs:
-      - /tmp:size=512m
+      # Request workspaces live here: upload spool + extracted layout +
+      # recompressed layers + output archive.  Sized via the environment.
+      - /tmp:size=${REPACK_TMPFS_SIZE:-8g}
+    environment:
+      # Must be smaller than the tmpfs above (default 4 GiB).
+      - REPACK_MAX_UPLOAD_BYTES=${REPACK_MAX_UPLOAD_BYTES:-4294967296}
     security_opt:
       - no-new-privileges:true
